@@ -13,7 +13,7 @@
 # Default intermediate artifacts directory is in ~/.cache/nanochat
 export PATH=/$HOME/.local/bin:$PATH
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+export NANOCHAT_BASE_DIR="workspace/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------
@@ -40,7 +40,6 @@ if [ -z "$WANDB_RUN" ]; then
     WANDB_RUN=dummy
 fi
 
-
 # -----------------------------------------------------------------------------
 # During the course of the run, we will be writing markdown reports to the report/
 # directory in the base dir. This command clears it out and writes a header section
@@ -55,31 +54,45 @@ python -m nanochat.report reset
 # so we download 2e9 / 250e6 = 8 data shards at this point
 # each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
 # look at dev/repackage_data_reference.py for details on how this data was prepared
-# -----------------------------UNCOMMENT PLEASE------------------------------------------------
-#python -m nanochat.dataset -n 8
-# -----------------------------UNCOMMENT PLEASE------------------------------------------------
+python -m nanochat.dataset -n 8
 # Immediately also kick off downloading more shards in the background while tokenizer trains
 # Approximately 150 shards are needed for GPT-2 capability pretraining, add 20 for padding.
 # The maximum total number of shards available in the entire dataset is 6542.
-# -----------------------------UNCOMMENT PLEASE------------------------------------------------
-#python -m nanochat.dataset -n 170 &
-# ATASET_DOWNLOAD_PID=$!
-# -----------------------------UNCOMMENT PLEASE------------------------------------------------
+python -m nanochat.dataset -n 170 &
+DATASET_DOWNLOAD_PID=$!
 # train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
-# -----------------------------UNCOMMENT PLEASE------------------------------------------------
-# python -m scripts.tok_train
-# -----------------------------UNCOMMENT PLEASE------------------------------------------------
+python -m scripts.tok_train
 # evaluate the tokenizer (report compression ratio etc.)
-# -----------------------------UNCOMMENT PLEASE------------------------------------------------
-#python -m scripts.tok_eval
-# -----------------------------UNCOMMENT PLEASE------------------------------------------------
+python -m scripts.tok_eval
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)
-# -----------------------------UNCOMMENT PLEASE------------------------------------------------
-#echo "Waiting for dataset download to complete..."
-#wait $DATASET_DOWNLOAD_PID
-# -----------------------------UNCOMMENT PLEASE------------------------------------------------
+echo "Waiting for dataset download to complete..."
+wait $DATASET_DOWNLOAD_PID
 
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-#torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN --window-pattern=L
+# evaluate the model: CORE metric, BPB on train/val, and draw samples
+torchrun --standalone --nproc_per_node=1 -m scripts.base_eval -- --device-batch-size=16
+
+# -----------------------------------------------------------------------------
+# SFT (teach the model conversation special tokens, tool use, multiple choice)
+
+# download 2.3MB of synthetic identity conversations to impart a personality to nanochat
+# see dev/gen_synthetic_data.py for details on how this data was prepared and to get a sense of how you can easily tune it
+curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+
+# run SFT and eval the model
+torchrun --standalone --nproc_per_node=1 -m scripts.chat_sft -- --device-batch-size=16 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=1 -m scripts.chat_eval -- -i sft
+
+# chat with the model over CLI! Leave out the -p to chat interactively
+# python -m scripts.chat_cli -p "Why is the sky blue?"
+
+# even better, chat with your model over a pretty WebUI ChatGPT style
+# python -m scripts.chat_web
+
+# -----------------------------------------------------------------------------
+# Generate the full report by putting together all the sections
+# report.md is the output and will be copied to current directory for convenience
+python -m nanochat.report generate
